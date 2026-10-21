@@ -1,126 +1,281 @@
-﻿#region Namespaces
-using Autodesk.Revit.ApplicationServices;
-using Autodesk.Revit.Attributes;
-using Autodesk.Revit.DB;
-using Autodesk.Revit.UI;
-using Autodesk.Revit.UI.Selection;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
+using System.Security.Cryptography;
+using Autodesk.Revit.ApplicationServices;
+using Autodesk.Revit.Attributes;
+using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Architecture;
-
-#endregion
+using Autodesk.Revit.DB.ExtensibleStorage;
+using Autodesk.Revit.UI;
+using Autodesk.Revit.UI.Selection;
 
 namespace RAA_Int_Module_02_Skills
 {
     [Transaction(TransactionMode.Manual)]
-    public class Command2 : IExternalCommand
+    public class Command2 : IExternalCommand   // CHANGED: new command, Command1 is untouched
     {
         public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
         {
-            // this is a variable for the Revit application
+            // Revit application and document variables
             UIApplication uiapp = commandData.Application;
+            UIDocument uidoc = uiapp.ActiveUIDocument;
+            Document doc = uidoc.Document;
 
-            // this is a variable for the current Revit model
-            Document doc = uiapp.ActiveUIDocument.Document;
-            // STEP 1: get all rooms
-            List<Room> rooms = new FilteredElementCollector(doc)
-                .OfCategory(BuiltInCategory.OST_Rooms)
-                .WhereElementIsNotElementType()
-                .OfType<Room>()
-                .ToList();
+            // CHANGED: no more doc.ActiveView - we collect all the views that need tagging
+            List<View> viewsToTag = GetViewsToTag(doc);
 
-            if (rooms.Count == 0)
+            // Cretion of List Of Catgeories
+            List<BuiltInCategory> allCat = new List<BuiltInCategory>();
+            allCat.Add(BuiltInCategory.OST_Areas);
+            allCat.Add(BuiltInCategory.OST_Walls);
+            allCat.Add(BuiltInCategory.OST_Doors);
+            allCat.Add(BuiltInCategory.OST_Furniture);
+            allCat.Add(BuiltInCategory.OST_LightingFixtures);
+            allCat.Add(BuiltInCategory.OST_Rooms);
+            allCat.Add(BuiltInCategory.OST_Windows);
+
+            // Creation of Category Filter
+            ElementMulticategoryFilter multicatFilter = new ElementMulticategoryFilter(allCat);
+
+            // CHANGED: the 7 copy-pasted LINQ blocks and the dictionary are now in one method
+            Dictionary<string, FamilySymbol> tags = GetTagSymbols(doc);
+
+            using (Transaction t = new Transaction(doc))
             {
-                TaskDialog.Show("Error", "No rooms found in this project.");
-                return Result.Failed;
-            }
+                t.Start("Insert Tags In All Views");   // CHANGED: transaction name
+                int tagCount = 0;
 
-            // STEP 2: get the unique department names
-            List<string> departments = new List<string>();
-            foreach (Room room in rooms)
-            {
-                string dept = room.LookupParameter("Department")?.AsString();
-                departments.Add(dept);
-            }
-            List<string> deptList = departments.Distinct().ToList();
-
-            // STEP 3: create the schedules
-            int count = 0;
-
-            using (Transaction t = new Transaction(doc, "Create room schedules"))
-            {
-                t.Start();
-
-                // one schedule per department
-                foreach (string dept in deptList)
+                // CHANGED: loop through the views, the per-view code lives in TagViewElements
+                foreach (View curView in viewsToTag)
                 {
-                    ViewSchedule sched = ViewSchedule.CreateSchedule(doc, new ElementId(BuiltInCategory.OST_Rooms));
-                    sched.Name = "Department - " + dept;
-                    ScheduleDefinition def = sched.Definition;
-
-                    // add columns (order here = order in the schedule)
-                    ScheduleField numberField = AddField(doc, def, "Number");
-                    ScheduleField nameField = AddField(doc, def, "Name");
-                    ScheduleField deptField = AddField(doc, def, "Department");
-                    AddField(doc, def, "Comments");
-                    ScheduleField areaField = AddField(doc, def, "Area");
-                    ScheduleField levelField = AddField(doc, def, "Level");
-
-                    // hide level (used only for grouping) and total the area
-                    levelField.IsHidden = true;
-                    areaField.DisplayType = ScheduleFieldDisplayType.Totals;
-
-                    // filter: only this department
-                    def.AddFilter(new ScheduleFilter(deptField.FieldId, ScheduleFilterType.Equal, dept));
-
-                    // sort by level (with header/footer), then by room name
-                    ScheduleSortGroupField levelSort = new ScheduleSortGroupField(levelField.FieldId);
-                    levelSort.ShowHeader = true;
-                    levelSort.ShowFooter = true;
-                    levelSort.ShowBlankLine = true;
-                    def.AddSortGroupField(levelSort);
-                    def.AddSortGroupField(new ScheduleSortGroupField(nameField.FieldId));
-
-                    // grand total
-                    def.ShowGrandTotal = true;
-                    def.ShowGrandTotalTitle = true;
-                    def.ShowGrandTotalCount = true;
-
-                    count++;
+                    tagCount += TagViewElements(doc, curView, multicatFilter, tags);
                 }
 
-                // one schedule for all departments (totals only)
-                ViewSchedule allSched = ViewSchedule.CreateSchedule(doc, new ElementId(BuiltInCategory.OST_Rooms));
-                allSched.Name = "All Departments";
-                ScheduleDefinition allDef = allSched.Definition;
-
-                ScheduleField allDeptField = AddField(doc, allDef, "Department");
-                ScheduleField allAreaField = AddField(doc, allDef, "Area");
-                allAreaField.DisplayType = ScheduleFieldDisplayType.Totals;
-
-                allDef.AddSortGroupField(new ScheduleSortGroupField(allDeptField.FieldId));
-                allDef.IsItemized = false;      // one row per department
-                allDef.ShowGrandTotal = true;
-                allDef.ShowGrandTotalTitle = true;
-
                 t.Commit();
+
+                // CHANGED: dialog moved after Commit
+                TaskDialog.Show("Tags Placed", $"{tagCount} Tags are placed in all views");
             }
-            TaskDialog.Show("Done", "Created " + count + " department schedules + 1 summary schedule.");
             return Result.Succeeded;
+
         }
-        // Finds a field by its name in Revit's list of allowed fields and adds it
-        private ScheduleField AddField(Document doc, ScheduleDefinition def, string fieldName)
+
+        // CHANGED (new method): returns all the views that need to be tagged
+        private List<View> GetViewsToTag(Document doc)
         {
-            foreach (SchedulableField sf in def.GetSchedulableFields())
+            List<View> viewsToTag = new List<View>();
+
+            FilteredElementCollector viewCollector = new FilteredElementCollector(doc)
+                .OfClass(typeof(View));
+
+            foreach (View curView in viewCollector)
             {
-                if (sf.GetName(doc) == fieldName)
-                    return def.AddField(sf);
+                // skip view templates
+                if (curView.IsTemplate)
+                    continue;
+
+                ViewType curViewType = curView.ViewType;
+
+                if (curViewType == ViewType.FloorPlan ||
+                    curViewType == ViewType.CeilingPlan ||
+                    curViewType == ViewType.AreaPlan)
+                {
+                    viewsToTag.Add(curView);
+                }
+                else if (curViewType == ViewType.Section && curView.Name.Equals("Section Through Main Stair"))
+                {
+                    // only this one section view is tagged
+                    viewsToTag.Add(curView);
+                }
             }
 
-            return null; // field not available
+            return viewsToTag;
+        }
+
+        // CHANGED (new method): replaces the repeated LINQ blocks + dictionary from Command1
+        private Dictionary<string, FamilySymbol> GetTagSymbols(Document doc)
+        {
+            //LINQ to get Family Symbols
+            FamilySymbol curtainWallTag = GetFamilySymbolByName(doc, "M_Curtain Wall Tag");
+            FamilySymbol doorTag = GetFamilySymbolByName(doc, "M_Door Tag");
+            FamilySymbol furnTag = GetFamilySymbolByName(doc, "M_Furniture Tag");
+            FamilySymbol ltgFixTag = GetFamilySymbolByName(doc, "M_Lighting Fixture Tag");
+            FamilySymbol roomTag = GetFamilySymbolByName(doc, "M_Room Tag");
+            FamilySymbol wallTag = GetFamilySymbolByName(doc, "M_Wall Tag");
+            FamilySymbol windowTag = GetFamilySymbolByName(doc, "M_Window Tag");
+
+            //Creation of the Dictioneries
+            Dictionary<string, FamilySymbol> tags = new Dictionary<string, FamilySymbol>();
+            //tags.Add("Areas", areaTag); not required for tagging
+            tags.Add("Curtain Walls", curtainWallTag);
+            tags.Add("Doors", doorTag);
+            tags.Add("Furniture", furnTag);
+            tags.Add("Lighting Fixtures", ltgFixTag);
+            tags.Add("Rooms", roomTag);
+            tags.Add("Walls", wallTag);
+            tags.Add("Windows", windowTag);
+
+            return tags;
+        }
+
+        // CHANGED (new method): same LINQ as Command1, written once
+        private FamilySymbol GetFamilySymbolByName(Document doc, string familyName)
+        {
+            FamilySymbol curSymbol = new FilteredElementCollector(doc)
+                .OfClass(typeof(FamilySymbol))
+                .Cast<FamilySymbol>()
+                .Where(x => x.FamilyName.Equals(familyName))
+                .First();
+
+            return curSymbol;
+        }
+
+        // CHANGED (new method): your Command1 foreach loop, now runs for one view and returns the tag count
+        private int TagViewElements(Document doc, View curView, ElementMulticategoryFilter multicatFilter, Dictionary<string, FamilySymbol> tags)
+        {
+            // CHANGED: collector is created per view
+            FilteredElementCollector collector = new FilteredElementCollector(doc, curView.Id);
+            collector.WherePasses(multicatFilter).WhereElementIsNotElementType();
+
+            int tagCount = 0;   // CHANGED: counter for this view only, added to the main counter in Execute
+
+            foreach (Element curElement in collector)
+            {
+                //Getting point from location
+                XYZ insPoint;
+                LocationPoint locPoint;
+                LocationCurve locCurve;
+
+                Location curLoc = curElement.Location;
+                if (curLoc == null)
+                    continue;
+
+                locPoint = curLoc as LocationPoint;
+                if (locPoint != null)
+                {
+                    //is location point
+                    insPoint = locPoint.Point;
+                }
+                else
+                {
+                    //is location curve
+                    locCurve = curLoc as LocationCurve;
+                    Curve curCurve = locCurve.Curve;
+
+                    insPoint = GetMidPointBetweenTwoPoints(curCurve.GetEndPoint(0), curCurve.GetEndPoint(1));
+                }
+
+                // Code is for only Area Tags as the logic nof independent tags not applied
+                ViewType curViewType = curView.ViewType;
+                if (curViewType == ViewType.AreaPlan)
+                {
+                    if (curElement.Category.Name == "Areas")
+                    {
+                        ViewPlan curAreaPlan = curView as ViewPlan;
+                        Area curArea = curElement as Area;
+
+                        AreaTag curAreaTag = doc.Create.NewAreaTag(curAreaPlan, curArea, new UV(insPoint.X, insPoint.Y));
+                        curAreaTag.TagHeadPosition = new XYZ(insPoint.X, insPoint.Y, 0);
+                        curAreaTag.HasLeader = false;
+                        tagCount++;
+
+                    }
+                    else continue;
+
+                }
+
+
+                else if (curViewType == ViewType.CeilingPlan)
+                {
+                    if (curElement.Category.Name == "Lighting Fixtures" || curElement.Category.Name == "Rooms")
+                    {
+                        FamilySymbol curTagType = tags[curElement.Category.Name];
+
+                        Reference curRef = new Reference(curElement);
+                        IndependentTag newtag = IndependentTag.Create(doc, curTagType.Id, curView.Id, curRef, false, TagOrientation.Horizontal, insPoint);
+                        tagCount++;
+                    }
+
+                }
+                else if (curViewType == ViewType.FloorPlan)
+                {
+                    if (curElement.Category.Name == "Walls")
+                    {
+                        Wall curWall = curElement as Wall;
+                        WallType curWallType = curWall.WallType;
+                        if (curWallType.Kind == WallKind.Curtain)
+                        {
+                            FamilySymbol curTagType = tags["Curtain Walls"];
+
+                            Reference curRef = new Reference(curElement);
+                            IndependentTag newtag = IndependentTag.Create(doc, curTagType.Id, curView.Id, curRef, false, TagOrientation.Horizontal, insPoint);
+                            tagCount++;
+                        }
+                        else
+                        {
+                            FamilySymbol curTagType = tags[curElement.Category.Name];
+
+                            Reference curRef = new Reference(curElement);
+                            IndependentTag newtag = IndependentTag.Create(doc, curTagType.Id, curView.Id, curRef, false, TagOrientation.Horizontal, insPoint);
+                            tagCount++;
+                        }
+                    }
+                    if (curElement.Category.Name == "Doors" ||
+                        curElement.Category.Name == "Furniture" ||
+                        curElement.Category.Name == "Rooms")
+                    {
+                        FamilySymbol curTagType = tags[curElement.Category.Name];
+
+                        Reference curRef = new Reference(curElement);
+                        IndependentTag newtag = IndependentTag.Create(doc, curTagType.Id, curView.Id, curRef, false, TagOrientation.Horizontal, insPoint);
+                        tagCount++;
+                    }
+                    else if (curElement.Category.Name == "Windows")
+                    {
+                        FamilySymbol curTagType = tags[curElement.Category.Name];
+
+                        Reference curRef = new Reference(curElement);
+                        IndependentTag newtag = IndependentTag.Create(doc, curTagType.Id, curView.Id, curRef, false, TagOrientation.Horizontal, insPoint);
+                        newtag.TagHeadPosition = new XYZ(insPoint.X, insPoint.Y + 3, insPoint.Z);
+                        tagCount++;
+                    }
+
+
+                }
+                else if (curViewType == ViewType.Section)
+                {
+                    if (curElement.Category.Name == "Rooms")
+
+                    {
+                        FamilySymbol curTagType = tags[curElement.Category.Name];
+
+                        Reference curRef = new Reference(curElement);
+                        IndependentTag newtag = IndependentTag.Create(doc, curTagType.Id, curView.Id, curRef, false, TagOrientation.Horizontal, insPoint);
+                        newtag.TagHeadPosition = new XYZ(insPoint.X, insPoint.Y, insPoint.Z + 3);
+                        newtag.HasLeader = false;
+                        tagCount++;
+                    }
+
+                }
+
+
+            }
+
+            return tagCount;   // CHANGED: returns the count to Execute
+        }
+
+        private XYZ GetMidPointBetweenTwoPoints(XYZ point1, XYZ point2)
+        {
+            XYZ midPoint = new XYZ(
+                (point1.X + point2.X) / 2,
+                (point1.Y + point2.Y) / 2,
+                (point1.Z + point2.Z) / 2);
+
+            return midPoint;
         }
     }
+
 }
